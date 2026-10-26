@@ -4,6 +4,8 @@ A spoken debug loop for blind coders. Python on Windows, with VS Code.
 
 When a script crashes, Grom says the error out loud, starting with what matters: the error and the line number. A small neural net then explains the error in plain words. You step through the rest with keys, and one key opens VS Code right at the broken line.
 
+Grom also watches scripts that finish **without** crashing. If a run looks off, a second neural net says what looked off and how sure it is.
+
 If NVDA, JAWS or another screen reader is running, Grom talks through it, so you only ever hear one voice.
 
 Free, for anyone.
@@ -16,9 +18,10 @@ Free, for anyone.
 |---|---|
 | Гром_GROM.py | The whole program |
 | grom_explain_net.json | The explaining net's trained weights |
+| grom_run_net.json | The run watcher's trained weights |
 | README.md | This |
 
-Keep all three in the same folder.
+Keep them all in the same folder.
 
 ---
 
@@ -58,6 +61,23 @@ NVDA and JAWS don't use any Ctrl+Shift+Alt keys, so these don't clash with your 
 
 If the net doesn't recognize the error, it says it isn't sure, instead of guessing.
 
+## When a run finishes but looks off
+
+When one of your scripts finishes without crashing, Grom checks what it printed and how long it took. If something looks off, it tells you what, and how sure it is (very sure, fairly sure, or not very sure). If nothing looks off, it stays quiet.
+
+It notices:
+
+- NaN or infinity showing up in the output
+- A loss going up instead of down, or staying flat
+- The same line repeating over and over, like a stuck loop. This works when you stop it with Ctrl+C too.
+- A script that usually prints something printing nothing
+- A run taking much longer, or much shorter, than that script usually takes
+- Warnings Python printed (not deprecation notices)
+
+Step through it with the same keys as a crash. Ctrl+Shift+Alt+N gives the detail.
+
+Grom learns what "usual" is for each script from its past runs, so timing and output checks start after a script has run a few times. It only watches scripts you run from a file, not `python -c`, libraries, or editor tools.
+
 ---
 
 ## Other commands
@@ -76,13 +96,13 @@ You should hear the error. Ctrl+Shift+Alt+N then gives the explanation.
 python Гром_GROM.py off
 ```
 
-**Retrain the explaining net** (needs numpy, `pip install numpy`):
+**Retrain both nets** (needs numpy, `pip install numpy`, and takes a few minutes):
 
 ```
 python Гром_GROM.py train
 ```
 
-It runs thousands of small broken scripts, learns from the real errors, tests itself on errors it never saw, and saves a new grom_explain_net.json.
+It runs thousands of small broken scripts and learns from the real errors. Then it makes thousands of runs, including real little learning loops that go right, blow up or stall, plus stuck loops, warnings and odd run times, and learns from those. It tests both nets on things they never saw and saves new weights.
 
 **If Ctrl+Shift+Alt+J doesn't open VS Code**, check this works:
 
@@ -116,6 +136,3 @@ Grom switches to it by itself.
 
 - Only tested so far by a sighted user. Feedback from blind coders is very welcome.
 
-## Coming
-
-- A second net that notices when a run looks wrong even without a crash, and says how sure it is.

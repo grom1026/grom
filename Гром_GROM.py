@@ -3,12 +3,15 @@
 # This one file is the whole program:
 #   - the crash catcher: when any Python script crashes, it says the error out loud
 #   - the explaining net: says what the error means, in plain words
+#   - the run watcher: when a script finishes without crashing but looks off
+#     (NaN, a loss going the wrong way, stuck loops, odd run times, warnings),
+#     a second net says what looked off and how sure it is
 #   - the key listener: steps through the crash, jumps to the broken line
 #   - setup and retraining
 #
 # Commands (run in this folder):
 #   python Гром_GROM.py           set up and turn Grom on (run once)
-#   python Гром_GROM.py train     retrain the explaining net (needs numpy)
+#   python Гром_GROM.py train     retrain both nets (needs numpy)
 #   python Гром_GROM.py off       turn Grom off and stop it starting at login
 #
 # Keys (work from any program while Grom is on):
@@ -364,9 +367,11 @@ def build_pieces(exc):
 
 
 def _speak_crash(exc_type, exc, tb):
+    global _crashed
     _original_hook(exc_type, exc, tb)  # normal error printout first
     if issubclass(exc_type, KeyboardInterrupt):
-        return
+        return   # stopped by hand: the run watcher still checks it (handy for stuck loops)
+    _crashed = True
     try:
         if exc.__traceback__ is None:
             exc.__traceback__ = tb
@@ -396,6 +401,414 @@ def _grom_is_on():
 
 def catch_crashes():
     sys.excepthook = _speak_crash
+    watch_runs()
+
+
+# =================================================================
+# RUN WATCHER - the second net. When one of your scripts finishes
+# WITHOUT crashing, Grom looks at what it printed and how long it took,
+# and says if something looks off, and how sure it is.
+# =================================================================
+
+RUN_NET_FILE = os.path.join(HERE, 'grom_run_net.json')
+HISTORY_FILE = os.path.join(DATA_DIR, 'run_history.json')
+SPEAK_ABOVE = 0.6      # the net has to be at least this sure before Grom says anything
+
+# each sign gets its own small net that only sees the evidence that matters for it,
+# so one sign can't drag another off (a timing quirk can't hide a blown-up loss)
+SIGN_GROUPS = [
+    (['nan'], list(range(0, 3))),                              # numbers gone bad
+    (['loss_up', 'loss_flat'], list(range(2, 13))),            # the loss
+    (['no_output'], list(range(13, 17))),                      # how much it printed
+    (['repeating'], [13] + list(range(17, 21))),               # repeats
+    (['too_slow', 'too_fast'], list(range(21, 26))),           # time
+    (['warnings'], list(range(26, 29))),                       # warnings
+]
+
+_run = None            # the run being watched right now
+_crashed = False       # a crash already got reported, so the watcher stays quiet
+
+SIGNS = ['nan', 'loss_up', 'loss_flat', 'no_output', 'repeating',
+         'too_slow', 'too_fast', 'warnings']
+
+NUMBER_GONE_BAD = re.compile(r'(?i)(?<![a-z])(nan|-?inf(?:inity)?)(?![a-z])')
+LOSS = re.compile(r"(?i)(?<![a-z])((?:train|training|val|valid|validation|test|eval)?[_ ]?"
+                  r"(?:loss|cost|mse|nll))['\"]?\s*[:=]?\s*"
+                  r"(-?(?:\d+\.\d*|\.\d+|\d+)(?:e[-+]?\d+)?|nan|-?inf(?:inity)?)(?![\w.])")
+SOFT_WARNINGS = ('DeprecationWarning', 'PendingDeprecationWarning', 'FutureWarning',
+                 'ImportWarning', 'ResourceWarning')
+
+
+class _RunRecord:
+    # keeps the first 200 and the last 3000 lines a script prints
+    def __init__(self, script):
+        import collections
+        self.script = script
+        self.start = time.time()
+        self.first = []
+        self.last = collections.deque(maxlen=3000)
+        self.count = 0
+        self.warnings = []     # (kind, file, line, message)
+        self._part = ''
+
+    def feed(self, text):
+        if '\n' not in text:
+            self._part += text
+            if len(self._part) > 20000:
+                self._part = self._part[-10000:]
+            return
+        text = self._part + text
+        parts = text.split('\n')
+        self._part = parts.pop()[-10000:]
+        for p in parts:
+            self._add(p)
+
+    def _add(self, line):
+        line = line.split('\r')[-1].rstrip()   # progress bars redraw with \r: keep the last drawing
+        self.count += 1
+        if len(self.first) < 200:
+            self.first.append(line)
+        else:
+            self.last.append(line)
+
+    def finish(self):
+        if self._part:
+            self._add(self._part)
+            self._part = ''
+        return self.first + list(self.last)
+
+
+class _Tee:
+    # passes everything through to the real output, and keeps a copy for the watcher
+    def __init__(self, stream, record):
+        self._stream = stream
+        self._record = record
+
+    def write(self, text):
+        try:
+            self._record.feed(text)
+        except Exception:
+            pass
+        return self._stream.write(text)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def watch_runs():
+    global _run
+    try:
+        script = sys.argv[0] if sys.argv else ''
+        # only scripts run from a file: not "python -c", not "python -m", not the >>> prompt
+        if not script.endswith(('.py', '.pyw')) or not os.path.isfile(script):
+            return
+        script = os.path.abspath(script)
+        if os.path.basename(script) == os.path.basename(os.path.abspath(__file__)):
+            return                      # Grom itself
+        if not _is_yours(script) or '.vscode' in script.lower():
+            return                      # a library's or an editor's script, not yours
+        _run = _RunRecord(script)
+        if sys.stdout is not None:
+            sys.stdout = _Tee(sys.stdout, _run)
+        if sys.stderr is not None:
+            sys.stderr = _Tee(sys.stderr, _run)
+
+        import warnings
+        real_show = warnings.showwarning
+
+        def show(message, category, filename, lineno, file=None, line=None):
+            try:
+                _run.warnings.append((category.__name__, filename, lineno, str(message)))
+            except Exception:
+                pass
+            return real_show(message, category, filename, lineno, file, line)
+        warnings.showwarning = show
+
+        import atexit
+        atexit.register(_check_run)
+    except Exception:
+        _run = None
+
+
+def _load_history():
+    try:
+        with open(HISTORY_FILE, encoding='utf-8') as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _check_run():
+    global _run
+    record, _run = _run, None
+    if record is None or _crashed:
+        return
+    try:
+        lines = record.finish()
+        seconds = time.time() - record.start
+        history = _load_history()
+        past = history.get(record.script, [])
+        report = check_run(lines, record.count, seconds, past, record.warnings, record.script)
+
+        # remember this run, so next time "usual" means something
+        past.append({'t': round(seconds, 3), 'lines': record.count})
+        history[record.script] = past[-20:]
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as fh:
+            json.dump(history, fh)
+
+        if report:
+            pieces, jump = report
+            with open(CRASH_FILE, 'w', encoding='utf-8') as fh:
+                json.dump({'time': time.time(), 'pieces': pieces, 'jump': jump}, fh)
+            if not _grom_is_on():
+                say(pieces[0])
+    except Exception:
+        pass  # the watcher must never break anyone's script
+
+
+# ---------------------------------------------------------------
+# what the second net reads: numbers that describe the run
+# ---------------------------------------------------------------
+
+def _median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    return 0.0 if not n else (xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2)
+
+
+def _loss_series(lines):
+    found = {}
+    for line in lines:
+        for key, value in LOSS.findall(line):
+            key = key.lower().replace(' ', '_').strip('_')
+            found.setdefault(key, []).append(value)
+    if not found:
+        return None, []
+    # the most-printed loss; training loss wins a tie over validation/test
+    key = max(found, key=lambda k: (len(found[k]), not k.startswith(('val', 'test', 'eval'))))
+    values = []
+    for v in found[key]:
+        try:
+            values.append(float(v))
+        except ValueError:
+            values.append(float('nan'))
+    return key, values
+
+
+def run_features(lines, count, seconds, past, warns):
+    """Turns one run into a list of numbers for the net, plus the facts Grom speaks."""
+    clip = lambda x, lo=-5.0, hi=5.0: max(lo, min(hi, x))  # noqa: E731
+    facts = {}
+
+    # 1. numbers gone bad
+    bad_lines = [ln for ln in lines if NUMBER_GONE_BAD.search(ln)]
+    facts['bad_count'] = len(bad_lines)
+    facts['bad_line'] = bad_lines[0] if bad_lines else ''
+    f = [math.log1p(len(bad_lines)), len(bad_lines) / max(1, len(lines))]
+
+    # 2. the loss
+    key, values = _loss_series(lines)
+    finite = [v for v in values if math.isfinite(v)]
+    facts['loss_key'] = key
+    f.append(math.log1p(len(values) - len(finite)))
+    if len(finite) >= 4:
+        n = len(finite)
+        k = max(1, n // 10)
+        raw_first, raw_last = sum(finite[:k]) / k, sum(finite[-k:]) / k
+        scale = sum(abs(v) for v in finite) / n + 1e-8
+        # the shape of the loss is measured on a squashed scale (like a log chart),
+        # so a loss that explodes to huge numbers still reads as a clear climb
+        mid = _median([abs(v) for v in finite]) + 1e-12
+        sq = [math.asinh(v / mid) for v in finite]
+        first, last = sum(sq[:k]) / k, sum(sq[-k:]) / k
+        xs = [i / (n - 1) for i in range(n)]
+        mx, my = sum(xs) / n, sum(sq) / n
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, sq)) / (sum((x - mx) ** 2 for x in xs) or 1)
+        lo, hi = min(sq), max(sq)
+        ups = sum(1 for a, b in zip(sq, sq[1:]) if b > a) / (n - 1)
+        third = sq[-max(2, n // 3):]
+        resid = [y - (my + slope * (x - mx)) for x, y in zip(xs, sq)]
+        noise = (sum(r * r for r in resid) / n) ** 0.5
+        f += [clip(slope / (noise + 1e-12) / 4), clip((last - first) / (hi - lo + 1e-12), -1, 1)]
+        f += [1.0, math.log1p(n) / 5,
+              clip(slope), clip((raw_last - raw_first) / (abs(raw_first) + 1e-8)),
+              ups, clip((max(finite) - min(finite)) / scale, 0, 10),
+              (last - lo) / (hi - lo + 1e-12),
+              clip(third[-1] - third[0])]
+        first, last, my = finite[0], finite[-1], sum(finite) / n   # what Grom reads out
+        facts.update(loss_first=first, loss_last=last, loss_mean=my)
+    else:
+        f += [0.0] * 10
+
+    # 3. output: how much, compared with usual, and repeats
+    past_lines = [p.get('lines', 0) for p in past]
+    usual_lines = _median(past_lines) if past_lines else 0
+    facts['usual_lines'] = usual_lines
+    f += [math.log1p(count) / 8, 1.0 if past_lines else 0.0,
+          clip(math.log((count + 1) / (usual_lines + 1))) if past_lines else 0.0,
+          1.0 if count == 0 else 0.0]
+
+    streak, best, best_line, prev = 0, 0, '', None
+    for ln in lines:
+        if ln.strip() and ln == prev:
+            streak += 1
+        else:
+            streak = 1 if ln.strip() else 0
+        if streak > best:
+            best, best_line = streak, ln
+        prev = ln
+    tail = [ln for ln in lines[-200:] if ln.strip()]
+    same_next = sum(1 for a, b in zip(tail, tail[1:]) if a == b) / max(1, len(tail) - 1)
+    facts['streak'], facts['streak_line'] = best, best_line
+    f += [math.log1p(best) / 8, same_next, len(set(tail)) / max(1, len(tail)),
+          math.log1p(streak) / 8]
+
+    # 4. time, compared with usual
+    past_t = [p.get('t', 0.0) for p in past if p.get('t', 0) > 0]
+    usual_t = _median(past_t) if past_t else 0.0
+    facts['usual_t'], facts['seconds'] = usual_t, seconds
+    if len(past_t) >= 1:
+        logs = [math.log(t + 0.05) for t in past_t]
+        spread = (sum((x - sum(logs) / len(logs)) ** 2 for x in logs) / len(logs)) ** 0.5
+        f += [min(len(past_t), 10) / 10, clip(math.log((seconds + 0.05) / (usual_t + 0.05))),
+              min(spread, 3.0), math.log1p(abs(seconds - usual_t)) / 5, math.log1p(seconds) / 5]
+    else:
+        f += [0.0, 0.0, 0.0, 0.0, math.log1p(seconds) / 5]
+
+    # 5. warnings
+    hard = [w for w in warns if w[0] not in SOFT_WARNINGS]
+    facts['warnings'] = hard
+    f += [math.log1p(len(hard)), math.log1p(len(warns) - len(hard)),
+          math.log1p(len(set((w[0], w[3]) for w in hard)))]
+    return f, facts
+
+
+# ---------------------------------------------------------------
+# the second net, and what Grom says
+# ---------------------------------------------------------------
+
+_run_net = None
+
+
+def _load_run_net():
+    global _run_net
+    if _run_net is None:
+        with open(RUN_NET_FILE, encoding='utf-8') as fh:
+            _run_net = json.load(fh)
+    return _run_net
+
+
+def run_guess(features):
+    """How sure the nets are about each sign, 0 to 1."""
+    out = {}
+    for part in _load_run_net()['groups']:
+        x = [(features[i] - m) / sd for i, m, sd in zip(part['features'], part['mean'], part['std'])]
+        hidden = list(part['b1'])
+        for i, v in enumerate(x):
+            row = part['W1'][i]
+            for j in range(len(hidden)):
+                hidden[j] += row[j] * v
+        hidden = [h if h > 0 else 0.0 for h in hidden]
+        for k, label in enumerate(part['labels']):
+            z = part['b2'][k] + sum(part['W2'][j][k] * h for j, h in enumerate(hidden))
+            out[label] = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
+    return out
+
+
+def _sure_words(p):
+    return 'Very sure.' if p >= 0.9 else ('Fairly sure.' if p >= 0.75 else 'Not very sure.')
+
+
+def _num(x):
+    if abs(x) >= 1e6 or (0 < abs(x) < 1e-3):
+        power = int(math.floor(math.log10(abs(x))))
+        return 'about {:.2g} times 10 to the {}'.format(x / 10 ** power, power)
+    if abs(x) >= 100 or x == int(x):
+        return '{:,.0f}'.format(x)
+    return '{:.3g}'.format(x)
+
+
+def _time_words(s):
+    if s < 1:
+        return 'under a second'
+    if s < 90:
+        return '{:.0f} seconds'.format(s)
+    if s < 5400:
+        return '{:.0f} minutes'.format(s / 60)
+    return '{:.1f} hours'.format(s / 3600)
+
+
+def _usually(s):
+    return 'under a second' if s < 1 else 'about ' + _time_words(s)
+
+
+def _short(line):
+    line = line.strip()
+    return line if len(line) <= 100 else line[:100] + '...'
+
+
+def _say_sign(sign, facts):
+    if sign == 'nan':
+        return ('numbers went bad. NaN or infinity showed up {} times'.format(facts['bad_count']),
+                'First place it showed up: ' + _short(facts['bad_line']))
+    if sign == 'loss_up':
+        return ('the {} went up instead of down, from {} to {}'.format(
+                    facts['loss_key'].replace('_', ' '), _num(facts['loss_first']), _num(facts['loss_last'])),
+                'A loss going up usually means the learning rate is too high, or the data and labels are mixed up.')
+    if sign == 'loss_flat':
+        return ('the {} stayed flat, around {}, so it may not be learning'.format(
+                    facts['loss_key'].replace('_', ' '), _num(facts['loss_mean'])),
+                'A flat loss usually means the learning rate is too low, or the weights are not being updated.')
+    if sign == 'no_output':
+        return ('it printed nothing, and it usually prints about {} lines'.format(_num(facts['usual_lines'])),
+                'It may have skipped the part that does the work, or quit early.')
+    if sign == 'repeating':
+        return ('the same line repeated {} times in a row'.format(facts['streak']),
+                'The line was: ' + _short(facts['streak_line']))
+    if sign == 'too_slow':
+        return ('it took {}, and it usually takes {}'.format(
+                    _time_words(facts['seconds']), _usually(facts['usual_t'])),
+                'Something may be stuck, or working on far more than usual.')
+    if sign == 'too_fast':
+        return ('it finished in {}, and it usually takes {}'.format(
+                    _time_words(facts['seconds']), _usually(facts['usual_t'])),
+                'It may have stopped early, or skipped the main work.')
+    if sign == 'warnings':
+        w = facts['warnings']
+        return ('Python gave {} warning{}'.format(len(w), '' if len(w) == 1 else 's'),
+                'The first: {}. {}. Line {}, in {}.'.format(
+                    _spoken_kind(w[0][0]), _short(w[0][3]), w[0][2], os.path.basename(w[0][1])))
+    return None
+
+
+def check_run(lines, count, seconds, past, warns, script):
+    """Returns (pieces, jump) if the run looks off, or None if it looks fine."""
+    features, facts = run_features(lines, count, seconds, past, warns)
+    sure = run_guess(features)
+    found = sorted((p, s) for s, p in sure.items() if p >= SPEAK_ABOVE)[::-1]
+    if not found:
+        return None
+    pieces = []
+    for n, (p, sign) in enumerate(found):
+        said = _say_sign(sign, facts)
+        if not said:
+            continue
+        head, detail = said
+        if n == 0:
+            pieces.append('The run of {} finished, but {}. {}'.format(
+                os.path.basename(script), head, _sure_words(p)))
+        else:
+            pieces.append('Also, {}. {}'.format(head, _sure_words(p)))
+        pieces.append(detail)
+    jump = {'file': script, 'line': 1}
+    if facts['warnings'] and _is_real_file(facts['warnings'][0][1]):
+        jump = {'file': os.path.abspath(facts['warnings'][0][1]), 'line': facts['warnings'][0][2]}
+    return (pieces, jump) if pieces else None
 
 
 # =================================================================
@@ -940,6 +1353,285 @@ def train_net(X, y, n_labels, hidden=64, epochs=60, lr=0.05, seed=0):
     return W1, b1, W2, b2
 
 
+# ---------------------------------------------------------------
+# training the second net (the run watcher)
+#   1. makes thousands of runs: real little learning loops that go
+#      right, blow up or stall, plus ordinary output, stuck loops,
+#      warnings, and runs that take far longer or shorter than usual
+#   2. trains the net to say which signs each run shows
+#   3. tests it on log styles and words it never saw
+#   4. saves grom_run_net.json next to this file
+# ---------------------------------------------------------------
+
+LOG_STYLES_TRAIN = [
+    'epoch {i} loss {v:.4f}',
+    'Epoch {i}/{n} - loss: {v:.4f}',
+    'step {i:5d} | loss: {v:.4f}',
+    'iter {i}: loss={v:.5f}',
+    '[{i}] cost = {v:.4f}',
+    'epoch {i:3d}  train_loss {v:.4f}  val_loss {u:.4f}',
+    '{i}/{n} mse: {v:.3e}',
+    'batch {i} loss {v:.6f} lr 0.001',
+]
+LOG_STYLES_TEST = [
+    "{{'loss': {v:.4f}, 'learning_rate': 5e-05, 'epoch': {i}}}",
+    'Epoch {i}: 100%|##########| 32/32 [00:01<00:00, train_loss={v:.3f}]',
+    'it {i} -- training loss {v:.4f}',
+    'Loss: {v:.4f} (epoch {i})',
+]
+PLAIN_TRAIN = ['Loaded {k} rows from {w}.csv', 'Processing {w} ...', 'Saved {w}.png', 'Found {k} files',
+               '{w}: {k}', 'Done.', 'Total: {f:.2f}', 'accuracy {f:.3f}', 'result = [{k}, {k2}, {k3}]',
+               'INFO: started {w}', '{w} {w2} {w3}', '-' * 20, '', 'writing {w}.json', 'best score {f:.4f}']
+PLAIN_TEST = ['Reading {w}.txt', 'got {k} {w}s', 'average {f:.3f}', 'model saved to {w}/', '>>> {w2} ok',
+              'financial {w} report', 'nancy {w}', 'information: {k}']
+WORDS_TRAIN = ['frames', 'data', 'vocab', 'model', 'user', 'grid', 'tokens', 'scores', 'images', 'net']
+WORDS_TEST = ['ship', 'tolstoy', 'cloud', 'pixel', 'pylon', 'thunder', 'paint']
+STUCK_LINES = ['waiting for data...', 'None', '0', 'retrying', 'Connection refused, retrying',
+               'still running', 'ERROR: queue empty', 'tick', '[]']
+HARD_WARNINGS = [('RuntimeWarning', 'overflow encountered in multiply'),
+                 ('RuntimeWarning', 'invalid value encountered in divide'),
+                 ('RuntimeWarning', 'divide by zero encountered in log'),
+                 ('UserWarning', 'The given NumPy array is not writable'),
+                 ('RuntimeWarning', 'Mean of empty slice')]
+SOFT_WARNING_LIST = [('DeprecationWarning', 'This function is deprecated'),
+                     ('FutureWarning', 'The default value will change in a future version'),
+                     ('PendingDeprecationWarning', 'matrix subclass is not the recommended way')]
+
+
+def _learning_run(rnd, mode, style):
+    # a real little learning loop (linear regression), run for real
+    import warnings
+    import numpy as np
+    rs = np.random.RandomState(rnd.randint(0, 10 ** 8))
+    d, n = rnd.randint(3, 40), rnd.randint(60, 500)
+    X = rs.randn(n, d)
+    y = X @ rs.randn(d) + rs.randn(n) * rnd.choice([0.01, 0.1, 0.5, 1.0])
+    lr = {'good': 10 ** rnd.uniform(-2.3, -0.8), 'high': 10 ** rnd.uniform(0.3, 1.3),
+          'low': 10 ** rnd.uniform(-7, -5.5), 'stuck': 0.0,
+          'wrong_sign': 10 ** rnd.uniform(-3.3, -1.8)}[mode]
+    sign = 1 if mode == 'wrong_sign' else -1     # the bug: + instead of -
+    scale = 10 ** rnd.uniform(-2, 2)
+    offset = 0.0 if rnd.random() < 0.7 else rnd.uniform(-300, 300) * scale
+    epochs = rnd.randint(8, 300) if mode != 'high' or rnd.random() < 0.5 else rnd.randint(8, 60)
+    every = max(1, epochs // rnd.randint(5, 60))
+    batch = rnd.choice([n, 32, 64])
+    w = np.zeros(d)
+    cap = 10 ** rnd.uniform(2, 250) if mode == 'high' and rnd.random() < 0.5 else None
+    lines, values = [], []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        for ep in range(1, epochs + 1):
+            idx = rs.choice(n, min(batch, n), replace=False)
+            err = X[idx] @ w - y[idx]
+            loss = float(np.mean(err ** 2)) * scale + offset
+            w = w + sign * lr * (2 * X[idx].T @ err / len(idx))
+            if ep == 1 or ep % every == 0:
+                values.append(loss)
+                u = loss * rnd.uniform(1.0, 1.3) if math.isfinite(loss) else loss
+                lines.append(style.format(i=ep, n=epochs, v=loss, u=u))
+            if cap and loss > cap:
+                break
+    warns = [(c.category.__name__, 'train.py', rnd.randint(5, 80), str(c.message)) for c in caught]
+    finite = [v for v in values if math.isfinite(v)]
+    up = mode in ('high', 'wrong_sign') and _visibly_up(finite)
+    flat = mode in ('low', 'stuck') and len(finite) >= 4
+    return lines, warns, up, flat
+
+
+def _visibly_up(finite):
+    # the end of the loss is clearly above its start, judged on the same
+    # log-like scale the net uses (so explosive climbs count)
+    if len(finite) < 4:
+        return False
+    mid = _median([abs(v) for v in finite]) + 1e-12
+    sq = [math.asinh(v / mid) for v in finite]
+    k = max(1, len(sq) // 10)
+    first, last = sum(sq[:k]) / k, sum(sq[-k:]) / k
+    return last - first > 0.5 * (max(sq) - min(sq)) and \
+        sum(finite[-k:]) / k - sum(finite[:k]) / k > 0.02 * (sum(abs(v) for v in finite) / len(finite))
+
+
+def _plain_lines(rnd, templates, words, how_many):
+    out = []
+    for _ in range(how_many):
+        t = rnd.choice(templates)
+        out.append(t.format(w=rnd.choice(words), w2=rnd.choice(words), w3=rnd.choice(words),
+                            k=rnd.randint(0, 5000), k2=rnd.randint(0, 99), k3=rnd.randint(0, 99),
+                            f=rnd.uniform(0, 100)))
+    return out
+
+
+def make_run(rnd, test=False):
+    """One made-up run of a script: what it printed, how long, its past runs, and the true signs."""
+    styles = LOG_STYLES_TEST if test else LOG_STYLES_TRAIN
+    plain = PLAIN_TEST if test else PLAIN_TRAIN
+    words = WORDS_TEST if test else WORDS_TRAIN
+    label = dict.fromkeys(SIGNS, 0)
+    warns = []
+
+    # what it printed
+    if rnd.random() < 0.45:
+        mode = rnd.choice(['good', 'good', 'good', 'high', 'wrong_sign', 'low', 'stuck'])
+        lines, warns, up, flat = _learning_run(rnd, mode, rnd.choice(styles))
+        label['loss_up'], label['loss_flat'] = int(up), int(flat)
+        lines = _plain_lines(rnd, plain, words, rnd.randint(0, 5)) + lines + \
+            _plain_lines(rnd, plain, words, rnd.randint(0, 3))
+    else:
+        lines = _plain_lines(rnd, plain, words, rnd.choice([1, 3, 10, 40, 150, 600]))
+        if rnd.random() < 0.08:
+            lines.insert(rnd.randint(0, len(lines)), 'value: {}'.format(rnd.choice(['nan', 'inf', '-inf', 'NaN'])))
+
+    # a stuck loop, or a harmless short repeat
+    if rnd.random() < 0.2:
+        stuck = rnd.choice(STUCK_LINES)
+        if rnd.random() < 0.6:
+            many = rnd.choice([30, 60, 200, 1000, 3000])
+            label['repeating'] = 1
+        else:
+            many = rnd.randint(2, 8)
+        at = rnd.randint(0, len(lines))
+        lines = lines[:at] + [stuck] * many + (lines[at:] if rnd.random() < 0.5 else [])
+
+    # warnings
+    if rnd.random() < 0.2:
+        kinds = HARD_WARNINGS if rnd.random() < 0.6 else SOFT_WARNING_LIST
+        for _ in range(rnd.randint(1, 3)):
+            k, m = rnd.choice(kinds)
+            warns.append((k, 'script.py', rnd.randint(1, 200), m))
+
+    # its past runs: how long they took, how much they printed
+    usual_t = 10 ** rnd.uniform(-1.6, 3.5)
+    usual_lines = max(0, int(len(lines) * rnd.uniform(0.6, 1.6)))
+    spread = rnd.uniform(0.03, 0.4)
+    past = [{'t': usual_t * math.exp(rnd.gauss(0, spread)),
+             'lines': max(0, int(usual_lines * math.exp(rnd.gauss(0, spread))))}
+            for _ in range(rnd.choice([0, 0, 1, 2, 3, 5, 10, 20]))]
+
+    # printed nothing at all
+    if rnd.random() < 0.08:
+        lines = []
+        if past and _median([p['lines'] for p in past]) >= 3:
+            label['no_output'] = 1
+        label['loss_up'] = label['loss_flat'] = label['repeating'] = 0
+
+    # how long this run took
+    r = rnd.random()
+    if r < 0.15:
+        seconds = usual_t * rnd.uniform(5, 60)
+        if len(past) >= 3 and seconds - usual_t >= 3:
+            label['too_slow'] = 1
+    elif r < 0.3:
+        seconds = usual_t / rnd.uniform(5, 60)
+        if len(past) >= 3 and usual_t - seconds >= 1:
+            label['too_fast'] = 1
+        if lines and rnd.random() < 0.5:
+            lines = lines[:max(1, int(len(lines) * rnd.uniform(0.05, 0.6)))]   # quit early, printed less
+    else:
+        seconds = usual_t * math.exp(rnd.gauss(0, 0.3))
+
+    # a loss sign only counts if the loss can actually be seen in what got printed
+    _, seen = _loss_series(lines)
+    seen = [v for v in seen if math.isfinite(v)]
+    if len(seen) < 4:
+        label['loss_up'] = label['loss_flat'] = 0
+    elif label['loss_up'] and not _visibly_up(seen):
+        label['loss_up'] = 0
+    if any(NUMBER_GONE_BAD.search(ln) for ln in lines):
+        label['nan'] = 1
+    if any(w[0] not in SOFT_WARNINGS for w in warns):
+        label['warnings'] = 1
+    return lines, len(lines), seconds, past, warns, [label[s] for s in SIGNS]
+
+
+def make_run_set(seed, count, test=False):
+    import warnings
+    warnings.filterwarnings('ignore')
+    rnd = random.Random(seed)
+    X, Y = [], []
+    for _ in range(count):
+        lines, n, seconds, past, warns, y = make_run(rnd, test)
+        X.append(run_features(lines, n, seconds, past, warns)[0])
+        Y.append(y)
+    return X, Y
+
+
+def _train_small_net(X, Y, hidden, epochs, lr, seed):
+    import numpy as np
+    mean, std = X.mean(0), np.maximum(X.std(0), 1e-3)
+    Xn = (X - mean) / std
+    rs = np.random.RandomState(seed)
+    W1 = rs.randn(X.shape[1], hidden) * 0.3
+    b1 = np.zeros(hidden)
+    W2 = rs.randn(hidden, Y.shape[1]) * 0.3
+    b2 = np.zeros(Y.shape[1])
+    params = [W1, b1, W2, b2]
+    m = [np.zeros_like(p) for p in params]
+    v = [np.zeros_like(p) for p in params]
+    t, total = 0, 0.0
+    for ep in range(epochs):
+        order = rs.permutation(len(X))
+        total = 0.0
+        for s in range(0, len(X), 128):
+            idx = order[s:s + 128]
+            xb, yb = Xn[idx], Y[idx]
+            h = np.maximum(xb @ W1 + b1, 0)
+            p = 1 / (1 + np.exp(-np.clip(h @ W2 + b2, -30, 30)))
+            total += -(yb * np.log(p + 1e-9) + (1 - yb) * np.log(1 - p + 1e-9)).sum()
+            g = (p - yb) / len(idx)
+            gh = (g @ W2.T) * (h > 0)
+            grads = [xb.T @ gh + 1e-4 * W1, gh.sum(0), h.T @ g + 1e-4 * W2, g.sum(0)]
+            t += 1
+            for k, (pa, gr) in enumerate(zip(params, grads)):   # Adam
+                m[k] = 0.9 * m[k] + 0.1 * gr
+                v[k] = 0.999 * v[k] + 0.001 * gr * gr
+                pa -= lr * (m[k] / (1 - 0.9 ** t)) / (np.sqrt(v[k] / (1 - 0.999 ** t)) + 1e-8)
+    return {'mean': mean.round(6).tolist(), 'std': std.round(6).tolist(),
+            'W1': W1.round(5).tolist(), 'b1': b1.round(5).tolist(),
+            'W2': W2.round(5).tolist(), 'b2': b2.round(5).tolist()}, total / len(X) / Y.shape[1]
+
+
+def train_run_net(X, Y, hidden=24, epochs=60, lr=0.01, seed=0):
+    import numpy as np
+    X, Y = np.array(X, np.float64), np.array(Y, np.float64)
+    groups = []
+    for labels, feats in SIGN_GROUPS:
+        cols = [SIGNS.index(lb) for lb in labels]
+        part, err = _train_small_net(X[:, feats], Y[:, cols], hidden, epochs, lr, seed)
+        part.update(labels=labels, features=feats)
+        groups.append(part)
+        print('  trained the net for {:22s} error {:.4f}'.format(' and '.join(labels), err))
+    return {'groups': groups}
+
+
+def retrain_run():
+    import numpy as np
+    global _run_net
+    print('Making training runs (real little learning loops, stuck loops, warnings, timing)...')
+    X, Y = make_run_set(seed=1, count=40000)
+    print('  {} training runs'.format(len(X)))
+    print('Making test runs with log styles and words the net never saw...')
+    Xt, Yt = make_run_set(seed=2, count=4000, test=True)
+    print('  {} test runs'.format(len(Xt)))
+    print('Training...')
+    net = train_run_net(X, Y)
+    _run_net = net
+    P = np.array([[run_guess(x)[s] for s in SIGNS] for x in Xt])
+    Yt = np.array(Yt)
+    said = P >= SPEAK_ABOVE
+    print('Test, on runs it never saw:')
+    print('  fine runs Grom stayed quiet on: {:.1f}%'.format(100 * (~said[Yt.sum(1) == 0].any(1)).mean()))
+    for k, s in enumerate(SIGNS):
+        real = Yt[:, k] == 1
+        caught = (said[real, k]).mean() if real.any() else float('nan')
+        false = (said[~real, k]).mean()
+        print('  {:10s} caught {:5.1f}% of {:4d}   wrongly said {:4.1f}%'.format(
+            s, 100 * caught, int(real.sum()), 100 * false))
+    with open(RUN_NET_FILE, 'w', encoding='utf-8') as fh:
+        json.dump(net, fh, separators=(',', ':'))
+    print('Saved grom_run_net.json')
+
+
+
 def retrain():
     import warnings
     import numpy as np
@@ -970,6 +1662,9 @@ def retrain():
     with open(NET_FILE, 'w', encoding='utf-8') as fh:
         json.dump(net, fh, separators=(',', ':'))
     print('Saved grom_explain_net.json')
+    print()
+    print('Now the second net, the run watcher.')
+    retrain_run()
 
 
 # =================================================================
